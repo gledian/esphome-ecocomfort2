@@ -1,0 +1,89 @@
+blueprint:
+  name: "VMC Season Auto-Switch"
+  description: >
+    Automatically switches VMC units between Winter and Summer mode based on
+    outdoor temperature. Uses hysteresis (separate thresholds for summer/winter)
+    and a configurable duration requirement to prevent flip-flopping in shoulder
+    seasons.
+
+    - Summer: outdoor temp stays above the summer threshold for the configured duration
+    - Winter: outdoor temp stays below the winter threshold for the configured duration
+
+    Requires the ESPHome Ecocomfort 2.0 package.
+  domain: automation
+  source_url: https://github.com/gledian/esphome-ecocomfort2/blob/main/blueprints/vmc_season_auto_switch.yaml
+  input:
+    outdoor_temp_sensor:
+      name: "Outdoor Temperature Sensor"
+      description: "Sensor providing outdoor temperature (e.g., weather station, Weather Underground)"
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+    vmc_season_entities:
+      name: "VMC Season Entities"
+      description: "All VMC season select entities to control"
+      selector:
+        entity:
+          domain: select
+          multiple: true
+    summer_threshold:
+      name: "Summer Threshold (°C)"
+      description: "Switch to Summer when outdoor temp stays above this value"
+      default: 20
+      selector:
+        number:
+          min: 15
+          max: 35
+          unit_of_measurement: "°C"
+    winter_threshold:
+      name: "Winter Threshold (°C)"
+      description: "Switch to Winter when outdoor temp stays below this value"
+      default: 15
+      selector:
+        number:
+          min: 0
+          max: 25
+          unit_of_measurement: "°C"
+    duration:
+      name: "Duration"
+      description: "How long the temperature must stay above/below the threshold before switching"
+      default:
+        hours: 4
+      selector:
+        duration:
+
+mode: single
+
+trigger:
+  - platform: numeric_state
+    entity_id: !input outdoor_temp_sensor
+    above: !input summer_threshold
+    for: !input duration
+    id: summer
+  - platform: numeric_state
+    entity_id: !input outdoor_temp_sensor
+    below: !input winter_threshold
+    for: !input duration
+    id: winter
+
+action:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: summer
+        sequence:
+          - action: select.select_option
+            target:
+              entity_id: !input vmc_season_entities
+            data:
+              option: "Summer"
+      - conditions:
+          - condition: trigger
+            id: winter
+        sequence:
+          - action: select.select_option
+            target:
+              entity_id: !input vmc_season_entities
+            data:
+              option: "Winter"

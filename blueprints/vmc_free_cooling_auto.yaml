@@ -1,0 +1,155 @@
+blueprint:
+  name: "VMC Free Cooling Auto"
+  description: >
+    Manages free cooling on VMC units based on season and time of day.
+
+    - Summer night: Low sensitivity (2°C delta) — maximizes passive cooling
+      when outdoor temperature drops below indoor
+    - Summer day: Medium sensitivity (4°C delta) — avoids marginal cooling cycles
+    - Winter: Off — free cooling is not useful with heat recovery active
+
+    The VMC firmware handles the actual indoor/outdoor temperature comparison
+    internally. This automation only sets the sensitivity level.
+
+    Night/day times are configurable. Reacts to season changes and time triggers.
+
+    Requires the ESPHome Ecocomfort 2.0 package.
+  domain: automation
+  source_url: https://github.com/gledian/esphome-ecocomfort2/blob/main/blueprints/vmc_free_cooling_auto.yaml
+  input:
+    vmc_season_entities:
+      name: "VMC Season Entities"
+      description: "All VMC season select entities (used to detect season changes)"
+      selector:
+        entity:
+          domain: select
+          multiple: true
+    vmc_free_cooling_entities:
+      name: "VMC Free Cooling Entities"
+      description: "All VMC free cooling select entities to control"
+      selector:
+        entity:
+          domain: select
+          multiple: true
+    season_check_entity:
+      name: "Season Check Entity"
+      description: "A single VMC season entity used to check current season (e.g., the first unit)"
+      selector:
+        entity:
+          domain: select
+    night_time:
+      name: "Night Start Time"
+      description: "When to switch to night mode (Low sensitivity)"
+      default: "22:00:00"
+      selector:
+        time:
+    day_time:
+      name: "Day Start Time"
+      description: "When to switch to day mode (Medium sensitivity)"
+      default: "07:00:00"
+      selector:
+        time:
+    night_level:
+      name: "Night Free Cooling Level"
+      description: "Free cooling sensitivity during night hours"
+      default: "Low"
+      selector:
+        select:
+          options:
+            - "Off"
+            - "Low"
+            - "Medium"
+            - "High"
+    day_level:
+      name: "Day Free Cooling Level"
+      description: "Free cooling sensitivity during day hours"
+      default: "Medium"
+      selector:
+        select:
+          options:
+            - "Off"
+            - "Low"
+            - "Medium"
+            - "High"
+
+mode: single
+max_exceeded: silent
+
+trigger:
+  - platform: state
+    entity_id: !input vmc_season_entities
+    to: "Summer"
+    id: to_summer
+  - platform: state
+    entity_id: !input vmc_season_entities
+    to: "Winter"
+    id: to_winter
+  - platform: time
+    at: !input night_time
+    id: night
+  - platform: time
+    at: !input day_time
+    id: day
+
+action:
+  - choose:
+      # Winter → turn off free cooling
+      - conditions:
+          - condition: trigger
+            id: to_winter
+        sequence:
+          - action: select.select_option
+            target:
+              entity_id: !input vmc_free_cooling_entities
+            data:
+              option: "Off"
+
+      # Season switched to Summer → set based on current time
+      - conditions:
+          - condition: trigger
+            id: to_summer
+        sequence:
+          - if:
+              - condition: time
+                after: !input night_time
+                before: !input day_time
+            then:
+              - action: select.select_option
+                target:
+                  entity_id: !input vmc_free_cooling_entities
+                data:
+                  option: !input night_level
+            else:
+              - action: select.select_option
+                target:
+                  entity_id: !input vmc_free_cooling_entities
+                data:
+                  option: !input day_level
+
+      # Night time trigger (only if Summer)
+      - conditions:
+          - condition: trigger
+            id: night
+          - condition: state
+            entity_id: !input season_check_entity
+            state: "Summer"
+        sequence:
+          - action: select.select_option
+            target:
+              entity_id: !input vmc_free_cooling_entities
+            data:
+              option: !input night_level
+
+      # Day time trigger (only if Summer)
+      - conditions:
+          - condition: trigger
+            id: day
+          - condition: state
+            entity_id: !input season_check_entity
+            state: "Summer"
+        sequence:
+          - action: select.select_option
+            target:
+              entity_id: !input vmc_free_cooling_entities
+            data:
+              option: !input day_level

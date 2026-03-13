@@ -172,6 +172,15 @@ All communication uses a single BLE GATT service:
 
 Service UUID: `f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d`
 
+## 📦 Blueprints (One-Click Install)
+
+Ready-to-use automations — import directly into Home Assistant:
+
+| Blueprint | Description | Import |
+|-----------|-------------|--------|
+| [Season Auto-Switch](blueprints/vmc_season_auto_switch.yaml) | Switches Winter/Summer based on outdoor temperature with hysteresis | [![Import](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fgledian%2Fesphome-ecocomfort2%2Fblob%2Fmain%2Fblueprints%2Fvmc_season_auto_switch.yaml) |
+| [Free Cooling Auto](blueprints/vmc_free_cooling_auto.yaml) | Manages free cooling by season and time of day | [![Import](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fgledian%2Fesphome-ecocomfort2%2Fblob%2Fmain%2Fblueprints%2Fvmc_free_cooling_auto.yaml) |
+
 ## 🏡 Home Assistant Automation Examples
 
 ### 🔥❄️ Auto season switch based on outdoor temperature
