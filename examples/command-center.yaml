@@ -1,0 +1,71 @@
+# ESPHome Command Center - Example Configuration
+# ================================================
+# An ESP32 controlling multiple Ecocomfort 2.0 VMC units via BLE.
+# Each unit is included as a package with its own MAC address and name.
+#
+# Steps:
+#   1. Flash an ESP32 with this config
+#   2. Put each VMC in pairing mode (hold button 5 seconds until LED blinks)
+#   3. The ESP32 auto-connects and pairs via BLE
+#   4. All entities appear in Home Assistant automatically
+#
+# Hardware: any ESP32 dev board (BLE is built-in, no extra hardware needed)
+# Range: ~10m through walls (BLE). One ESP32 can control up to 3-4 units
+#         reliably. Use multiple ESP32s for larger installations.
+
+substitutions:
+  name: esphome-vmc-controller
+  friendly_name: VMC Controller
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2024.6.0
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret vmc_api_key
+
+ota:
+  - platform: esphome
+    password: !secret vmc_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# Required: HA time source for clock sync with VMC units
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# --- VMC Unit Packages ---
+# Add one block per VMC unit. Find the MAC address in the Intelliclima app
+# or by scanning BLE devices (the VMC advertises as "Comfort_XXXX").
+packages:
+  vmc_living_room: !include
+    file: packages/ecocomfort2.yaml
+    vars:
+      mac_address: "AA:BB:CC:DD:EE:FF"    # Replace with your VMC's BLE MAC
+      unit_id: vmc_living_room              # Unique ID (used in all entity IDs)
+      unit_name: "VMC Living Room"          # Human-readable name
+
+  vmc_bedroom: !include
+    file: packages/ecocomfort2.yaml
+    vars:
+      mac_address: "11:22:33:44:55:66"
+      unit_id: vmc_bedroom
+      unit_name: "VMC Bedroom"
+
+# --- Common Buttons ---
+button:
+  - platform: restart
+    name: "Restart ESPHome Device"

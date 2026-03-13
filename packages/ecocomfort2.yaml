@@ -1,0 +1,1227 @@
+# ==============================================================================
+# VMC Ecocomfort 2.0 - ESPHome Unit Package Template
+# ==============================================================================
+#
+# Controls an Intelliclima Ecocomfort 2.0 VMC (Ventilation Mechanical Controlled)
+# unit via Bluetooth Low Energy. Each VMC is a wall-mounted heat-recovery
+# ventilator that alternates between pushing fresh air in and extracting stale
+# air out, recovering heat through a ceramic core.
+#
+# This package is included once per VMC unit from the main CC yaml, with vars:
+#   mac_address  - BLE MAC of the VMC device
+#   unit_id      - unique identifier (e.g. vmc_kitchen), used for all entity IDs
+#   unit_name    - human-readable name (e.g. "VMC Kitchen")
+#
+# BLE Protocol Summary
+# --------------------
+# All communication uses a single BLE GATT service:
+#   Service UUID: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+#
+# Characteristics:
+#   C_INFO            f5f56229-...  Read    Firmware version, serial, MAC
+#   C_STATE           438d3433-...  Read    Real-time: temp, humidity, VOC, direction
+#   C_SETTING_OPER    b9d6f678-...  R/W     Operating mode (2 bytes: preset + speed)
+#   C_CONFIGURATION   d3dac48e-...  R/W     Device config (12 bytes: role, thresholds, season, etc.)
+#   C_SETTING_CLOCK   82788997-...  Write   Clock sync (8 bytes, hourly via interval)
+#   C_ADVANCED        f8b2284e-...  R/W     Sensor calibration offsets (4 bytes: temp + humidity)
+#   C_PROGRAMS        4a3561b0-...  R/W     Weekly schedule (168 bytes, not implemented — HA automations are more flexible)
+#   C_STATS           ab53b5e0-...  Read    Usage statistics
+#
+# Sensor Calibration Offsets (C_ADVANCED_SETTINGS, 4 bytes)
+# ---------------------------------------------------------
+# Applied by the device to correct raw sensor readings. Written as big-endian
+# signed 16-bit integers with 1/100 resolution (e.g., 150 = +1.50°C).
+#
+# Bytes 0-1: Temperature offset (signed int16, /100 for °C)
+# Bytes 2-3: Humidity offset (signed int16, /100 for %RH)
+#
+# Sensor Thresholds (bytes 1-3 of C_CONFIGURATION)
+# -------------------------------------------------
+# Control the sensitivity of the "Sensor" preset mode. When humidity or VOC
+# exceeds the threshold, the device reacts automatically.
+# Values 0-3: 0=disabled, 1=low, 2=medium, 3=high.
+#   Humidity:   1=55%, 2=60%, 3=65%
+#   VOC:        1=250ppm, 2=300ppm, 3=350ppm
+#   Luminosity: 1=0.1lux, 2=0.125lux, 3=0.150lux
+#
+# Without advanced mode (+128): exceeding the threshold triggers a BOOST to
+# maximum speed. With advanced mode: speed is increased by ONE STEP only.
+#
+# Byte 1: Humidity threshold (0-3 base, +128 for advanced mode)
+# Byte 2: Luminosity threshold (0-3)
+# Byte 3: VOC threshold (0-3 base, +128 for advanced mode)
+#
+# Operating Mode Protocol (C_SETTING_OPERATION, 2 bytes)
+# -------------------------------------------------------
+# Byte 0 - Preset/Direction:
+#   0x00 = Off
+#   0x01 = Air In only
+#   0x02 = Air Out only
+#   0x03 = Alternating In/Out (most common)
+#   0x04 = Sensor-driven (auto speed by humidity/VOC) or full Auto
+#
+# Byte 1 - Speed + flags:
+#   Bits 0-3: Speed value
+#     0x00 = Off, 0x01 = Sleep, 0x02 = Vel1, 0x03 = Vel2, 0x04 = Vel3
+#   Bit 4 (0x10): Auto mode flag (device controls speed autonomously)
+#   Bit 5 (0x20): Advanced control flag (device adjusts speed +1)
+#   Bit 6 (0x40): Boost active (read-only, auto-triggered by device in Sensor mode)
+#   Bit 7 (0x80): Force Night/Sleep (overrides to minimum speed)
+#
+# Configuration Protocol (C_CONFIGURATION, 12 bytes)
+# ---------------------------------------------------
+# When writing, byte value 0x7F means "preserve existing value" (don't change).
+# This allows changing season or free cooling without affecting other settings.
+#
+# Byte 0:  Role (0x00=unconfigured, 0x01=master, 0x02=slave)
+# Byte 1:  Humidity threshold (0-3, or 128+ for advanced)
+# Byte 2:  Luminosity threshold
+# Byte 3:  VOC threshold (0-3, or 128+ for advanced)
+# Byte 4:  Combined: bits 0-1 = free cooling (0-3), bit 3 = season (0=winter, 1=summer)
+#          Free cooling levels: 0=Off, 1=Low(2°C), 2=Medium(4°C), 3=High(6°C)
+#          (delta between indoor and outdoor temperature to activate)
+#          Free cooling is only active when season = Summer.
+#          Special write values:
+#            Season write:       0x1F = summer, 0x00 = winter (preserves free cooling)
+#            Free cooling write: 0x70 + value (preserves season)
+# Byte 5:  Rotation (0=none, 1=concordant, 2=discordant) — for slave units only
+# Bytes 6-11: Master BLE address (for slave units), otherwise 0x00
+#
+# HA Entities Summary (replace <unit> with your unit_id, e.g. vmc_kitchen)
+# -------------------------------------------------------------------------
+# CONTROLLABLE:
+#   fan.<unit>                         Main control: on/off, speed (25-100%), preset mode
+#   switch.<unit>_humidity_advanced    Toggle adaptive humidity threshold algorithm
+#   switch.<unit>_voc_advanced         Toggle adaptive VOC threshold algorithm
+#   number.<unit>_humidity_threshold   Humidity sensitivity for Sensor mode (0-3)
+#   number.<unit>_luminosity_threshold Luminosity sensitivity for Sensor mode (0-3)
+#   number.<unit>_voc_threshold        VOC sensitivity for Sensor mode (0-3)
+#   number.<unit>_set_temp_offset      Temperature calibration offset (°C)
+#   number.<unit>_set_humidity_offset  Humidity calibration offset (%)
+#   select.<unit>_season               Winter (heat recovery) / Summer (bypass)
+#   select.<unit>_free_cooling         Free cooling intensity: Off/Low/Medium/High
+#   button.<unit>_pair                 Manual BLE re-pairing
+#
+# READ-ONLY:
+#   binary_sensor.<unit>_connected     BLE connection status
+#   binary_sensor.<unit>_boost_active  Device auto-boost status (Sensor mode only)
+#   sensor.<unit>_temperature          Indoor temperature (°C)
+#   sensor.<unit>_humidity             Indoor humidity (%RH)
+#   sensor.<unit>_voc                  Air quality - VOC (ppb)
+#   sensor.<unit>_direction            Current airflow direction
+#   sensor.<unit>_actual_mode          Current operating mode (0-4)
+#   sensor.<unit>_actual_speed         Current speed level (1-4, or 5 if boosting)
+#   text_sensor.<unit>_firmware_text    Device firmware version (e.g., "0.6.8")
+#   sensor.<unit>_role                 Master/slave role (0-2)
+#   sensor.<unit>_temp_offset          Current temp offset on device (°C)
+#   sensor.<unit>_humidity_offset      Current humidity offset on device (%)
+# ==============================================================================
+
+
+# ==============================================================================
+# GLOBALS — Persistent state that survives reboots (stored in ESP32 flash)
+# ==============================================================================
+globals:
+  # The desired airflow direction/mode to send to the device.
+  # Maps to byte 0 of C_SETTING_OPERATION.
+  # Values: 0x01=In, 0x02=Out, 0x03=In/Out, 0x04=Sensor/Auto
+  - id: ${unit_id}_desired_preset
+    type: uint8_t
+    restore_value: yes
+    initial_value: '0x03'  # Default: In/Out (alternating)
+
+  # The desired fan speed to send to the device.
+  # Maps to byte 1 of C_SETTING_OPERATION (bits 0-3).
+  # Values: 0x01=Sleep, 0x02=Vel1, 0x03=Vel2, 0x04=Vel3
+  - id: ${unit_id}_desired_speed
+    type: uint8_t
+    restore_value: yes
+    initial_value: '0x03'  # Default: Vel2
+
+  # Guard flag: set synchronously around make_call().perform() in readback
+  # lambdas so that on_preset_set skips the BLE write. Reset immediately
+  # after perform() returns (no race — callbacks fire synchronously).
+  - id: ${unit_id}_skip_send
+    type: bool
+    initial_value: 'false'
+
+
+
+
+# ==============================================================================
+# BLE CLIENT — Connection management to the VMC device
+# ==============================================================================
+ble_client:
+  - mac_address: ${mac_address}
+    id: ${unit_id}_BLE
+    auto_connect: true
+    on_connect:
+      then:
+        - lambda: |-
+            ESP_LOGI("ble", "Connected to ${unit_name}, pairing...");
+            id(${unit_id}_BLE)->pair();
+        - binary_sensor.template.publish:
+            id: ${unit_id}_connected
+            state: true
+        # Wait for BLE stack to stabilize after pairing before sending commands
+        - delay: 500ms
+        # Re-send current fan state to sync device after a reconnect.
+        # Without this, the device could be in a different state than what HA shows
+        # (e.g., after a BLE dropout where a command was lost).
+        - if:
+            condition:
+              fan.is_on: ${unit_id}_fan
+            then:
+              - script.execute: ${unit_id}_send_command
+    on_disconnect:
+      then:
+        - lambda: |-
+            ESP_LOGW("ble", "Disconnected from ${unit_name}");
+        - binary_sensor.template.publish:
+            id: ${unit_id}_connected
+            state: false
+
+
+# ==============================================================================
+# FAN ENTITY — Native HA fan with speed steps and preset modes
+# ==============================================================================
+# Changing any property (on/off, speed, preset) automatically sends the
+# corresponding BLE command to the device.
+#
+# Speed steps (4 levels, matching the device's manual mode):
+#   25%  = Sleep  (0x01) —  8.0 m³/h, 2.0W, quietest
+#   50%  = Vel1   (0x02) — 20.5 m³/h, 2.5W
+#   75%  = Vel2   (0x03) — 35.0 m³/h, 4.0W
+#   100% = Vel3   (0x04) — 48.5 m³/h, 6.3W
+#
+# Note: Boost is NOT a user-controllable speed — it activates automatically
+# when the device is in "Sensor" mode and humidity/VOC exceeds thresholds.
+# A read-only binary sensor exposes when the device enters boost.
+#
+# Preset modes (airflow direction):
+#   "In"     — fresh air intake only (e.g., bring in fresh air)
+#              NOTE: reverts to Auto after 60 minutes (device firmware behavior)
+#   "Out"    — exhaust only (e.g., remove smoke, cooking fumes)
+#              NOTE: reverts to Auto after 60 minutes (device firmware behavior)
+#   "In/Out" — alternating intake/exhaust with heat recovery (normal operation)
+#   "Sensor" — device auto-adjusts speed based on humidity/VOC sensor readings
+#              and configured thresholds. Boost may activate automatically.
+#   "Auto"   — fully autonomous mode (speed byte = 0x10, device has full control)
+#
+# HA entity: fan.vmc_<unit>
+#
+# HA automation examples:
+#
+#   Turn on VMC at medium speed in alternating mode:
+#     service: fan.turn_on
+#     target:
+#       entity_id: fan.vmc_living_room
+#     data:
+#       percentage: 75
+#       preset_mode: "In/Out"
+#
+#   Switch to exhaust-only at max speed (e.g., smoke detected):
+#     service: fan.set_preset_mode
+#     target:
+#       entity_id: fan.vmc_kitchen
+#     data:
+#       preset_mode: "Out"
+#
+#   Set to Sensor mode (let the device decide speed based on air quality):
+#     service: fan.set_preset_mode
+#     target:
+#       entity_id: fan.vmc_bathroom_pt
+#     data:
+#       preset_mode: "Sensor"
+fan:
+  - platform: template
+    name: "${unit_name}"
+    id: ${unit_id}_fan
+    icon: "mdi:air-purifier"
+    speed_count: 4  # 25%=Sleep, 50%=Vel1, 75%=Vel2, 100%=Vel3
+    preset_modes:
+      - "In"
+      - "Out"
+      - "In/Out"
+      - "Sensor"
+      - "Auto"
+
+    on_turn_on:
+      # Small delay to let speed/preset callbacks fire first when HA sends
+      # a combined turn_on + set_speed + set_preset in a single service call
+      - delay: 50ms
+      - script.execute: ${unit_id}_send_command
+
+    on_turn_off:
+      - script.execute: ${unit_id}_send_off
+
+    on_speed_set:
+      - lambda: |-
+          // Map speed to device byte (1=Sleep, 2=Vel1, 3=Vel2, 4=Vel3)
+          // x may be percentage (25,50,75,100) or level (1,2,3,4)
+          uint8_t spd;
+          if (x > 4) {
+            spd = (uint8_t)(x / 25);     // percentage → level
+          } else {
+            spd = (uint8_t)x;            // already level
+          }
+          if (spd < 1) spd = 1;
+          if (spd > 4) spd = 4;
+          ESP_LOGD("vmc", "${unit_name} on_speed_set: x=%d spd=0x%02X", (int)x, spd);
+          id(${unit_id}_desired_speed) = spd;
+          if (id(${unit_id}_fan)->state) {
+            id(${unit_id}_send_command).execute();
+          }
+
+    on_preset_set:
+      - lambda: |-
+          // Skip if triggered by BLE readback (flag set/reset synchronously around perform())
+          if (id(${unit_id}_skip_send)) return;
+          // Map preset name to device mode byte (byte 0 of C_SETTING_OPERATION)
+          uint8_t p = 0x03;
+          if (x == "In")          p = 0x01;
+          else if (x == "Out")    p = 0x02;
+          else if (x == "In/Out") p = 0x03;
+          else if (x == "Sensor") p = 0x04;  // Sensor-driven: device adjusts speed
+          else if (x == "Auto")   p = 0x04;  // Full auto: same mode byte, different speed byte
+          id(${unit_id}_desired_preset) = p;
+          if (id(${unit_id}_fan)->state) {
+            id(${unit_id}_send_command).execute();
+          }
+
+
+# ==============================================================================
+# SCRIPTS — BLE command senders
+# ==============================================================================
+script:
+  # Send the current desired state (preset + speed) to the device.
+  # mode: restart — if called multiple times rapidly (e.g., user drags HA slider),
+  # the script restarts each time. Only the final value after 100ms of quiet
+  # is actually sent, preventing BLE congestion.
+  - id: ${unit_id}_send_command
+    mode: restart
+    then:
+      - delay: 100ms  # Debounce
+      - if:
+          condition:
+            binary_sensor.is_on: ${unit_id}_connected
+          then:
+            - ble_client.ble_write:
+                id: ${unit_id}_BLE
+                service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+                characteristic_uuid: b9d6f678-bc0d-4a73-90c8-60b0f07301f1
+                value: !lambda |-
+                  uint8_t preset = id(${unit_id}_desired_preset);
+                  uint8_t speed = id(${unit_id}_desired_speed);
+
+                  // "Auto" preset: speed byte must be 0x10 (auto flag)
+                  // instead of a manual speed value
+                  auto pm = id(${unit_id}_fan)->get_preset_mode();
+                  if (pm == "Auto") {
+                    speed = 0x10;
+                  }
+
+                  ESP_LOGI("vmc", "${unit_name} -> preset=0x%02X speed=0x%02X", preset, speed);
+                  return {preset, speed};
+          else:
+            - lambda: |-
+                ESP_LOGW("vmc", "${unit_name}: Not connected, command not sent");
+
+  # Send OFF command (both bytes = 0x00)
+  - id: ${unit_id}_send_off
+    mode: single
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: ${unit_id}_connected
+          then:
+            - lambda: |-
+                ESP_LOGI("vmc", "${unit_name} -> OFF");
+            - ble_client.ble_write:
+                id: ${unit_id}_BLE
+                service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+                characteristic_uuid: b9d6f678-bc0d-4a73-90c8-60b0f07301f1
+                value: [0x00, 0x00]
+          else:
+            - lambda: |-
+                ESP_LOGW("vmc", "${unit_name}: Not connected, OFF command not sent");
+
+  # Write season to C_CONFIGURATION. Uses 0x7F mask for all other bytes.
+  # Byte 4: 0x1F = summer (bit3=1), 0x00 = winter (bit3=0).
+  - id: ${unit_id}_write_season
+    mode: restart
+    then:
+      - delay: 50ms  # Yield to event loop so optimistic state update completes
+      - if:
+          condition:
+            binary_sensor.is_on: ${unit_id}_connected
+          then:
+            - ble_client.ble_write:
+                id: ${unit_id}_BLE
+                service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+                characteristic_uuid: d3dac48e-b4e1-4f3a-8715-326ddf1da89a
+                value: !lambda |-
+                  // Read current season select state
+                  auto val = id(${unit_id}_season_select).current_option();
+                  uint8_t season_byte = (val == "Summer") ? 0x1F : 0x00;
+                  ESP_LOGI("vmc", "${unit_name} -> Season: %s (byte4=0x%02X)", val.c_str(), season_byte);
+                  // 0x7F = preserve existing value for that byte position
+                  return {
+                    (uint8_t)0x7F,         // byte 0: role — preserve
+                    (uint8_t)0x7F,         // byte 1: humidity threshold — preserve
+                    (uint8_t)0x7F,         // byte 2: luminosity threshold — preserve
+                    (uint8_t)0x7F,         // byte 3: VOC threshold — preserve
+                    season_byte,           // byte 4: season (0x1F=summer, 0x00=winter)
+                    (uint8_t)0x7F,         // byte 5: rotation — preserve
+                    (uint8_t)0x00,         // bytes 6-11: master address — not used
+                    (uint8_t)0x00,
+                    (uint8_t)0x00,
+                    (uint8_t)0x00,
+                    (uint8_t)0x00,
+                    (uint8_t)0x00
+                  };
+          else:
+            - lambda: |-
+                ESP_LOGW("vmc", "${unit_name}: Not connected, season write not sent");
+
+  # Write free cooling to C_CONFIGURATION. Uses 0x7F mask for all other bytes.
+  # Byte 4: 0x70 + value (0-3). The 0x70 prefix tells the device firmware
+  # to preserve the season bit.
+  - id: ${unit_id}_write_free_cooling
+    mode: restart
+    then:
+      - delay: 50ms
+      - if:
+          condition:
+            binary_sensor.is_on: ${unit_id}_connected
+          then:
+            - ble_client.ble_write:
+                id: ${unit_id}_BLE
+                service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+                characteristic_uuid: d3dac48e-b4e1-4f3a-8715-326ddf1da89a
+                value: !lambda |-
+                  auto val = id(${unit_id}_free_cooling_select).current_option();
+                  uint8_t fc_value = 0;
+                  if (val == "Low")         fc_value = 1;
+                  else if (val == "Medium")  fc_value = 2;
+                  else if (val == "High")    fc_value = 3;
+                  // 0x70 prefix = "free cooling write, preserve season"
+                  uint8_t byte4 = 0x70 + fc_value;
+                  ESP_LOGI("vmc", "${unit_name} -> Free Cooling: %s (byte4=0x%02X)", val.c_str(), byte4);
+                  return {
+                    (uint8_t)0x7F,         // byte 0: role — preserve
+                    (uint8_t)0x7F,         // byte 1: humidity threshold — preserve
+                    (uint8_t)0x7F,         // byte 2: luminosity threshold — preserve
+                    (uint8_t)0x7F,         // byte 3: VOC threshold — preserve
+                    byte4,                 // byte 4: free cooling (0x70 + 0-3)
+                    (uint8_t)0x7F,         // byte 5: rotation — preserve
+                    (uint8_t)0x00,         // bytes 6-11: master address — not used
+                    (uint8_t)0x00,
+                    (uint8_t)0x00,
+                    (uint8_t)0x00,
+                    (uint8_t)0x00,
+                    (uint8_t)0x00
+                  };
+          else:
+            - lambda: |-
+                ESP_LOGW("vmc", "${unit_name}: Not connected, free cooling write not sent");
+
+  # Write sensor thresholds to C_CONFIGURATION (12 bytes).
+  # Writes humidity (byte 1), luminosity (byte 2), and VOC (byte 3) thresholds
+  # in a single BLE write. Uses 0x7F for bytes 0, 4, 5 to preserve role,
+  # season/free-cooling, and rotation settings.
+  #
+  # The "advanced" flag (128+) changes threshold behavior for humidity and VOC:
+  # Without advanced: exceeding threshold triggers BOOST (max speed).
+  # With advanced: exceeding threshold increases speed by ONE STEP only.
+  - id: ${unit_id}_write_thresholds
+    mode: restart
+    then:
+      - delay: 50ms
+      - if:
+          condition:
+            binary_sensor.is_on: ${unit_id}_connected
+          then:
+            - ble_client.ble_write:
+                id: ${unit_id}_BLE
+                service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+                characteristic_uuid: d3dac48e-b4e1-4f3a-8715-326ddf1da89a
+                value: !lambda |-
+                  // Humidity: base value (0-3) + advanced flag (128) if enabled
+                  uint8_t hum = (uint8_t)id(${unit_id}_humidity_threshold).state;
+                  if (id(${unit_id}_humidity_advanced).state) hum += 128;
+
+                  // Luminosity: direct value (0-3), no advanced flag
+                  uint8_t lum = (uint8_t)id(${unit_id}_luminosity_threshold).state;
+
+                  // VOC: base value (0-3) + advanced flag (128) if enabled
+                  uint8_t voc = (uint8_t)id(${unit_id}_voc_threshold).state;
+                  if (id(${unit_id}_voc_advanced).state) voc += 128;
+
+                  ESP_LOGI("vmc", "${unit_name} -> Thresholds: hum=%d lum=%d voc=%d", hum, lum, voc);
+                  return {
+                    (uint8_t)0x7F,         // byte 0: role — preserve
+                    hum,                   // byte 1: humidity threshold
+                    lum,                   // byte 2: luminosity threshold
+                    voc,                   // byte 3: VOC threshold
+                    (uint8_t)0x7F,         // byte 4: season/free cooling — preserve
+                    (uint8_t)0x7F,         // byte 5: rotation — preserve
+                    (uint8_t)0x00,         // bytes 6-11: master address — not used
+                    (uint8_t)0x00,
+                    (uint8_t)0x00,
+                    (uint8_t)0x00,
+                    (uint8_t)0x00,
+                    (uint8_t)0x00
+                  };
+          else:
+            - lambda: |-
+                ESP_LOGW("vmc", "${unit_name}: Not connected, threshold write not sent");
+
+  # Write sensor calibration offsets to C_ADVANCED_SETTINGS (4 bytes).
+  # The device applies these offsets to its raw temperature and humidity readings.
+  # Both values are big-endian signed 16-bit integers with 1/100 resolution:
+  #   Bytes 0-1: temperature offset (e.g., 150 = +1.50°C correction)
+  #   Bytes 2-3: humidity offset (e.g., -200 = -2.00% correction)
+  #
+  # Practical range: ±5°C for temperature, ±5% for humidity.
+  # Use a reference thermometer/hygrometer to determine the correction needed.
+  - id: ${unit_id}_write_offsets
+    mode: restart
+    then:
+      - delay: 50ms
+      - if:
+          condition:
+            binary_sensor.is_on: ${unit_id}_connected
+          then:
+            - ble_client.ble_write:
+                id: ${unit_id}_BLE
+                service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+                characteristic_uuid: f8b2284e-61dd-44e3-a782-a93c9503ab2d
+                value: !lambda |-
+                  // Convert float offset to signed 16-bit integer (×100)
+                  int16_t temp_raw = (int16_t)(id(${unit_id}_set_temp_offset).state * 100.0f);
+                  int16_t hum_raw = (int16_t)(id(${unit_id}_set_humidity_offset).state * 100.0f);
+                  ESP_LOGI("vmc", "${unit_name} -> Offsets: temp=%d/100 hum=%d/100", temp_raw, hum_raw);
+                  // Big-endian: high byte first, then low byte
+                  return {
+                    (uint8_t)((temp_raw >> 8) & 0xFF),   // temp offset high byte
+                    (uint8_t)(temp_raw & 0xFF),           // temp offset low byte
+                    (uint8_t)((hum_raw >> 8) & 0xFF),     // humidity offset high byte
+                    (uint8_t)(hum_raw & 0xFF)             // humidity offset low byte
+                  };
+          else:
+            - lambda: |-
+                ESP_LOGW("vmc", "${unit_name}: Not connected, offset write not sent");
+
+
+# ==============================================================================
+# BINARY SENSORS
+# ==============================================================================
+binary_sensor:
+  # BLE connection status — true when the ESP32 has an active BLE connection
+  # to this VMC unit. Use in HA automations as a condition before sending
+  # commands, or to trigger alerts when a unit goes offline.
+  #
+  # HA automation example — notify when VMC disconnects:
+  #   trigger:
+  #     - platform: state
+  #       entity_id: binary_sensor.vmc_kitchen_connected
+  #       to: "off"
+  #       for: "00:05:00"
+  #   action:
+  #     - service: notify.mobile_app
+  #       data:
+  #         message: "VMC Kitchen disconnected for 5 minutes"
+  - platform: template
+    name: "${unit_name} - Connected"
+    id: ${unit_id}_connected
+    device_class: connectivity
+    icon: "mdi:bluetooth-connect"
+
+  # Boost Active — read-only indicator that the device has automatically
+  # entered boost mode (maximum airflow). This happens when the VMC is in
+  # "Sensor" preset mode and the built-in humidity or VOC sensor detects
+  # levels above the configured thresholds. Boost cannot be commanded via
+  # BLE — it is entirely controlled by the device's internal logic.
+  #
+  # Detected from bit 6 (0x40) of the speed byte in C_SETTING_OPERATION readback.
+  #
+  # HA automation example — log when boost activates:
+  #   trigger:
+  #     - platform: state
+  #       entity_id: binary_sensor.vmc_bathroom_pt_boost_active
+  #       to: "on"
+  #   action:
+  #     - service: logbook.log
+  #       data:
+  #         name: "VMC Bathroom"
+  #         message: "Boost activated (high humidity/VOC detected)"
+  - platform: template
+    name: "${unit_name} - Boost Active"
+    id: ${unit_id}_boost_active
+    icon: "mdi:fan-alert"
+
+
+# ==============================================================================
+# SWITCHES
+# ==============================================================================
+switch:
+  # Humidity Advanced Mode — changes how the device reacts when humidity
+  # exceeds the configured threshold. When OFF, exceeding the threshold
+  # triggers a BOOST to maximum speed. When ON, the speed is only increased
+  # by ONE STEP (e.g., Vel1→Vel2), which is gentler and avoids sudden
+  # full-speed bursts from brief humidity spikes (e.g., opening a pot lid).
+  #
+  # Only affects behavior in "Sensor" preset mode.
+  # Encoded as +128 on the humidity threshold byte (byte 1 of C_CONFIGURATION).
+  #
+  # Recommendation: enable for bathrooms and kitchens where transient spikes
+  # are common. Leave off for rooms with stable humidity.
+  #
+  # HA entity: switch.vmc_<unit>_humidity_advanced
+  - platform: template
+    name: "${unit_name} - Humidity Advanced"
+    id: ${unit_id}_humidity_advanced
+    icon: "mdi:water-plus"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # VOC Advanced Mode — same concept as Humidity Advanced but for the VOC
+  # (Volatile Organic Compounds) sensor. When OFF, exceeding the threshold
+  # triggers a BOOST to maximum speed. When ON, the speed is only increased
+  # by ONE STEP, avoiding full-speed bursts from brief VOC spikes (e.g.,
+  # cooking, cleaning products).
+  #
+  # Only affects behavior in "Sensor" preset mode.
+  # Encoded as +128 on the VOC threshold byte (byte 3 of C_CONFIGURATION).
+  #
+  # HA entity: switch.vmc_<unit>_voc_advanced
+  - platform: template
+    name: "${unit_name} - VOC Advanced"
+    id: ${unit_id}_voc_advanced
+    icon: "mdi:molecule"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+
+# ==============================================================================
+# NUMBER ENTITIES — Sensor thresholds & calibration offsets
+# ==============================================================================
+number:
+  # ---------- Sensor Thresholds ----------
+  # These control how sensitive the "Sensor" preset mode is to environmental
+  # changes. Higher values = more sensitive (fan speeds up at lower levels).
+  # Only relevant when the fan is in "Sensor" preset mode.
+  # All three are written together in a single BLE command via write_thresholds.
+  #
+  # HA automation example — increase sensitivity when cooking:
+  #   trigger:
+  #     - platform: state
+  #       entity_id: binary_sensor.kitchen_stove
+  #       to: "on"
+  #   action:
+  #     - service: number.set_value
+  #       target:
+  #         entity_id: number.vmc_kitchen_voc_threshold
+  #       data:
+  #         value: 3
+
+  # Humidity threshold for Sensor mode (0-3).
+  # 0 = disabled, 1 = 55%, 2 = 60%, 3 = 65%
+  #
+  # HA entity: number.vmc_<unit>_humidity_threshold
+  - platform: template
+    name: "${unit_name} - Humidity Threshold"
+    id: ${unit_id}_humidity_threshold
+    icon: "mdi:water-thermometer"
+    min_value: 0
+    max_value: 3
+    step: 1
+    initial_value: 1
+    optimistic: true
+    set_action:
+      - script.execute: ${unit_id}_write_thresholds
+
+  # Luminosity threshold for Sensor mode (0-3).
+  # 0 = disabled, 1 = 0.1 lux, 2 = 0.125 lux, 3 = 0.150 lux
+  #
+  # HA entity: number.vmc_<unit>_luminosity_threshold
+  - platform: template
+    name: "${unit_name} - Luminosity Threshold"
+    id: ${unit_id}_luminosity_threshold
+    icon: "mdi:brightness-6"
+    min_value: 0
+    max_value: 3
+    step: 1
+    initial_value: 0
+    optimistic: true
+    set_action:
+      - script.execute: ${unit_id}_write_thresholds
+
+  # VOC threshold for Sensor mode (0-3).
+  # 0 = disabled, 1 = 250 ppm, 2 = 300 ppm, 3 = 350 ppm
+  #
+  # HA entity: number.vmc_<unit>_voc_threshold
+  - platform: template
+    name: "${unit_name} - VOC Threshold"
+    id: ${unit_id}_voc_threshold
+    icon: "mdi:scent"
+    min_value: 0
+    max_value: 3
+    step: 1
+    initial_value: 1
+    optimistic: true
+    set_action:
+      - script.execute: ${unit_id}_write_thresholds
+
+  # ---------- Sensor Calibration Offsets ----------
+  # One-time calibration to correct the VMC's built-in sensor readings.
+  # Compare the VMC's readings with a reference thermometer/hygrometer
+  # and enter the difference here. Both offsets are written together via BLE
+  # to C_ADVANCED_SETTINGS (4 bytes, big-endian signed int16 × 100).
+  #
+  # These are typically set once during installation and rarely changed.
+  # The device applies the offset internally — the corrected values are what
+  # the Temperature and Humidity sensors report.
+
+  # Temperature offset: added to the raw sensor reading.
+  # Example: if VMC reads 22°C but reference shows 21°C, set offset to -1.00.
+  #
+  # HA entity: number.vmc_<unit>_set_temp_offset
+  - platform: template
+    name: "${unit_name} - Set Temp Offset"
+    id: ${unit_id}_set_temp_offset
+    icon: "mdi:thermometer-plus"
+    unit_of_measurement: "°C"
+    min_value: -5.0
+    max_value: 5.0
+    step: 0.1
+    initial_value: 0.0
+    restore_value: true
+    optimistic: true
+    set_action:
+      - script.execute: ${unit_id}_write_offsets
+
+  # Humidity offset: added to the raw sensor reading.
+  # Example: if VMC reads 60% but reference shows 55%, set offset to -5.00.
+  #
+  # HA entity: number.vmc_<unit>_set_humidity_offset
+  - platform: template
+    name: "${unit_name} - Set Humidity Offset"
+    id: ${unit_id}_set_humidity_offset
+    icon: "mdi:water-plus-outline"
+    unit_of_measurement: "%"
+    min_value: -5.0
+    max_value: 5.0
+    step: 0.1
+    initial_value: 0.0
+    restore_value: true
+    optimistic: true
+    set_action:
+      - script.execute: ${unit_id}_write_offsets
+
+
+# ==============================================================================
+# SELECT ENTITIES — Season & Free Cooling
+# ==============================================================================
+select:
+  # Season — controls the VMC's heat recovery behavior.
+  #   Winter: heat recovery is active (ceramic core stores heat from exhaust
+  #           and transfers it to incoming fresh air, saving heating energy)
+  #   Summer: heat recovery is bypassed, allowing free cooling to work
+  #
+  # Written to byte 4 of C_CONFIGURATION: 0x00 = winter, 0x1F = summer.
+  #
+  # HA entity: select.vmc_<unit>_season
+  #
+  # HA automation example — switch season based on outdoor temperature:
+  #   trigger:
+  #     - platform: numeric_state
+  #       entity_id: sensor.outdoor_temperature
+  #       above: 22
+  #       for: "02:00:00"
+  #   action:
+  #     - service: select.select_option
+  #       target:
+  #         entity_id: select.vmc_living_room_season
+  #       data:
+  #         option: "Summer"
+  - platform: template
+    name: "${unit_name} - Season"
+    id: ${unit_id}_season_select
+    icon: "mdi:sun-snowflake-variant"
+    options:
+      - "Winter"
+      - "Summer"
+    initial_option: "Winter"
+    restore_value: true
+    optimistic: true
+    set_action:
+      - script.execute: ${unit_id}_write_season
+
+  # Free Cooling — bypasses heat recovery when outdoor air is cooler than indoor.
+  # Only meaningful in Summer mode. When outdoor temp drops below indoor temp,
+  # the VMC brings in cool outside air directly to cool the room passively
+  # without using air conditioning. Higher levels = more aggressive cooling.
+  #   Off  = disabled
+  #   Low  = gentle free cooling
+  #   Medium = moderate
+  #   High = maximum free cooling effect
+  #
+  # Written to byte 4 of C_CONFIGURATION as 0x70 + value (0-3).
+  #
+  # HA entity: select.vmc_<unit>_free_cooling
+  #
+  # HA automation example — enable free cooling on summer nights:
+  #   trigger:
+  #     - platform: numeric_state
+  #       entity_id: sensor.outdoor_temperature
+  #       below: "{{ states('sensor.vmc_living_room_temperature') | float - 3 }}"
+  #   condition:
+  #     - condition: state
+  #       entity_id: select.vmc_living_room_season
+  #       state: "Summer"
+  #   action:
+  #     - service: select.select_option
+  #       target:
+  #         entity_id: select.vmc_living_room_free_cooling
+  #       data:
+  #         option: "High"
+  - platform: template
+    name: "${unit_name} - Free Cooling"
+    id: ${unit_id}_free_cooling_select
+    icon: "mdi:snowflake-thermometer"
+    options:
+      - "Off"
+      - "Low"
+      - "Medium"
+      - "High"
+    initial_option: "Off"
+    restore_value: true
+    optimistic: true
+    set_action:
+      - script.execute: ${unit_id}_write_free_cooling
+
+
+# ==============================================================================
+# SENSORS — BLE readback from the device
+# ==============================================================================
+text_sensor:
+  # ---------- Device Info (C_INFO) ----------
+
+  # Firmware version as a human-readable string (e.g., "0.6.8").
+  # Parsed from C_INFO characteristic. The encoding uses:
+  #   Byte 0 high nibble: major version
+  #   Byte 0 low nibble + byte 1 (12 bits): upper 6 bits = minor, lower 6 bits = patch
+  - platform: template
+    name: "${unit_name} - Firmware Version"
+    id: ${unit_id}_firmware_text
+    icon: "mdi:information-outline"
+
+sensor:
+  # Firmware version reader — reads C_INFO and publishes to the text_sensor above.
+  # Returns 0 (value unused); the text_sensor holds the formatted version string.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${unit_id}_BLE
+    name: "${unit_name} - Firmware Raw"
+    id: ${unit_id}_firmware
+    service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+    characteristic_uuid: f5f56229-dd4f-480f-a829-9189269d8b37
+    icon: "mdi:information-outline"
+    internal: true
+    lambda: |-
+      uint8_t major = (x[0] >> 4) & 0x0F;
+      uint16_t temp = ((x[0] & 0x0F) << 8) | x[1];
+      uint8_t minor = (temp >> 6) & 0x3F;
+      uint8_t patch = temp & 0x3F;
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d.%d.%d", major, minor, patch);
+      id(${unit_id}_firmware_text).publish_state(buf);
+      return 0;
+
+  # ---------- Real-time Environmental Data (C_STATE) ----------
+  # The C_STATE characteristic returns a multi-byte payload with the VMC's
+  # built-in sensor readings. Multiple ESPHome sensors read the same
+  # characteristic but extract different bytes.
+
+  # Indoor temperature measured by the VMC's built-in sensor.
+  # Bytes 3-4 of C_STATE: signed 16-bit integer, divide by 100 for °C.
+  # Affected by the Set Temp Offset calibration value.
+  #
+  # HA entity: sensor.vmc_<unit>_temperature
+  #
+  # HA automation example — boost ventilation when room is hot in summer:
+  #   trigger:
+  #     - platform: numeric_state
+  #       entity_id: sensor.vmc_living_room_temperature
+  #       above: 28
+  #   condition:
+  #     - condition: state
+  #       entity_id: select.vmc_living_room_season
+  #       state: "Summer"
+  #   action:
+  #     - service: fan.set_percentage
+  #       target:
+  #         entity_id: fan.vmc_living_room
+  #       data:
+  #         percentage: 100
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${unit_id}_BLE
+    name: "${unit_name} - Temperature"
+    id: ${unit_id}_temp
+    service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+    characteristic_uuid: 438d3433-7e5a-459a-a8e4-66343fad2bb0
+    icon: "mdi:thermometer"
+    device_class: "temperature"
+    state_class: "measurement"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    lambda: |-
+      int16_t temp_raw = (int16_t)((x[3] << 8) | x[4]);
+      return temp_raw / 100.0f;
+
+  # Indoor humidity measured by the VMC's built-in sensor.
+  # Bytes 5-6 of C_STATE: unsigned 16-bit integer, divide by 100 for %RH.
+  # Affected by the Set Humidity Offset calibration value.
+  #
+  # HA entity: sensor.vmc_<unit>_humidity
+  #
+  # HA automation example — switch to Sensor mode when bathroom humidity rises:
+  #   trigger:
+  #     - platform: numeric_state
+  #       entity_id: sensor.vmc_bathroom_pt_humidity
+  #       above: 70
+  #   action:
+  #     - service: fan.set_preset_mode
+  #       target:
+  #         entity_id: fan.vmc_bathroom_pt
+  #       data:
+  #         preset_mode: "Sensor"
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${unit_id}_BLE
+    name: "${unit_name} - Humidity"
+    id: ${unit_id}_humidity
+    service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+    characteristic_uuid: 438d3433-7e5a-459a-a8e4-66343fad2bb0
+    icon: "mdi:water-percent"
+    device_class: "humidity"
+    state_class: "measurement"
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    lambda: |-
+      uint16_t humidity_raw = (x[5] << 8) | x[6];
+      return humidity_raw / 100.0f;
+
+  # Volatile Organic Compounds (VOC) measured by the VMC's built-in sensor.
+  # Bytes 7-8 of C_STATE: unsigned 16-bit integer, parts per billion (ppb).
+  # Used by the "Sensor" preset to auto-adjust fan speed when VOC exceeds
+  # the configured VOC Threshold. Higher ppb = worse air quality.
+  #
+  # HA entity: sensor.vmc_<unit>_voc
+  #
+  # HA automation example — force exhaust when VOC is very high:
+  #   trigger:
+  #     - platform: numeric_state
+  #       entity_id: sensor.vmc_kitchen_voc
+  #       above: 500
+  #   action:
+  #     - service: fan.set_preset_mode
+  #       target:
+  #         entity_id: fan.vmc_kitchen
+  #       data:
+  #         preset_mode: "Out"
+  #     - service: fan.set_percentage
+  #       target:
+  #         entity_id: fan.vmc_kitchen
+  #       data:
+  #         percentage: 100
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${unit_id}_BLE
+    name: "${unit_name} - VOC"
+    id: ${unit_id}_voc
+    service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+    characteristic_uuid: 438d3433-7e5a-459a-a8e4-66343fad2bb0
+    icon: "mdi:chemical-weapon"
+    device_class: "volatile_organic_compounds_parts"
+    state_class: "measurement"
+    unit_of_measurement: "ppb"
+    lambda: |-
+      uint16_t voc_raw = (x[7] << 8) | x[8];
+      return (float)voc_raw;
+
+  # Current airflow direction — shows what the VMC is doing right now.
+  # Byte 2 of C_STATE: indicates whether the device is currently pushing
+  # air in or pulling air out. In "In/Out" mode, this alternates as the
+  # device cycles between intake and exhaust phases.
+  #
+  # HA entity: sensor.vmc_<unit>_direction
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${unit_id}_BLE
+    name: "${unit_name} - Direction"
+    id: ${unit_id}_direction
+    service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+    characteristic_uuid: 438d3433-7e5a-459a-a8e4-66343fad2bb0
+    icon: "mdi:arrow-left-right"
+    force_update: true
+    lambda: |-
+      return (float)x[2];
+
+  # ---------- Operating State Readback (C_SETTING_OPERATION) ----------
+  # These sensors read the ACTUAL device state (what the device is doing right
+  # now), which may differ from what we commanded (e.g., device overrides in
+  # sensor mode). They also sync the HA fan entity to match reality.
+
+  # Actual operating mode — also updates the fan entity's preset mode.
+  # Byte 0: 0=off, 1=in, 2=out, 3=in-out, 4=sensor/auto
+  # For mode 4, we check the speed byte to distinguish "Sensor" from "Auto":
+  #   If speed has bit 4 (0x10) set → Auto, otherwise → Sensor.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${unit_id}_BLE
+    name: "${unit_name} - Actual Mode"
+    id: ${unit_id}_actual_mode
+    service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+    characteristic_uuid: b9d6f678-bc0d-4a73-90c8-60b0f07301f1
+    icon: "mdi:fan"
+    force_update: true
+    lambda: |-
+      uint8_t mode = x[0];
+      auto fan = id(${unit_id}_fan);
+      if (!id(${unit_id}_send_command).is_running()) {
+        if (mode == 0x00) {
+          // OFF: set state directly + publish (no callbacks triggered)
+          fan->state = false;
+          fan->publish_state();
+        } else {
+          // ON: set state directly (avoids on_turn_on), then use make_call
+          // only for preset_mode (private member, can't assign directly).
+          // skip_send prevents on_preset_set from sending a BLE command.
+          fan->state = true;
+          std::string preset = "In/Out";
+          if (mode == 0x01) preset = "In";
+          else if (mode == 0x02) preset = "Out";
+          else if (mode == 0x03) preset = "In/Out";
+          else if (mode == 0x04) {
+            uint8_t raw_speed = x[1];
+            if (raw_speed & 0x10) preset = "Auto";
+            else preset = "Sensor";
+          }
+          id(${unit_id}_skip_send) = true;
+          auto call = fan->make_call();
+          call.set_preset_mode(preset);
+          call.perform();
+          id(${unit_id}_skip_send) = false;
+        }
+      }
+      return (float)mode;
+
+  # Actual fan speed — also updates the fan entity's speed and boost switch.
+  # Byte 1 contains speed value in bits 0-3 plus override flags in bits 4-7.
+  # Priority: bit 7 (night forced) > bit 6 (boost forced) > base speed.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${unit_id}_BLE
+    name: "${unit_name} - Actual Speed"
+    id: ${unit_id}_actual_speed
+    service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+    characteristic_uuid: b9d6f678-bc0d-4a73-90c8-60b0f07301f1
+    icon: "mdi:speedometer"
+    force_update: true
+    lambda: |-
+      uint8_t raw = x[1];
+      uint8_t speed = raw & 0x0F;     // Base speed from bits 0-3
+      bool is_boost = (raw & 0x40) != 0;  // Bit 6: boost active (device auto-triggered)
+      if (raw & 0x80) speed = 1;       // Bit 7: night mode forced -> sleep
+
+      // Publish boost status to the read-only binary sensor
+      id(${unit_id}_boost_active).publish_state(is_boost);
+
+      // When boost is active, device runs at max — show Vel3 in fan entity
+      if (is_boost && speed < 4) speed = 4;
+
+      // Only sync from readback when no user command is pending
+      // (avoids overwriting user's intent during the debounce window)
+      if (!id(${unit_id}_send_command).is_running()) {
+        // Update fan speed directly (no make_call) to avoid triggering
+        // on_speed_set callback from readback
+        if (speed > 0 && speed <= 4) {
+          id(${unit_id}_fan)->speed = speed;
+          id(${unit_id}_fan)->publish_state();
+        }
+      }
+      return (float)speed;
+
+  # ---------- Sensor Calibration Offsets (C_ADVANCED_SETTINGS) ----------
+  # Applied by the device to correct raw sensor readings.
+
+  # Temperature calibration offset in degrees Celsius (read-only from device).
+  # Bytes 0-1: big-endian signed 16-bit, divide by 100.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${unit_id}_BLE
+    name: "${unit_name} - Temp Offset"
+    id: ${unit_id}_temp_offset
+    service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+    characteristic_uuid: f8b2284e-61dd-44e3-a782-a93c9503ab2d
+    icon: "mdi:thermometer-alert"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 2
+    lambda: |-
+      int16_t offset_raw = (int16_t)((x[0] << 8) | x[1]);
+      float val = offset_raw / 100.0f;
+      // Sync the "Set Temp Offset" entity with device readback
+      if (std::abs(id(${unit_id}_set_temp_offset).state - val) > 0.05f) {
+        id(${unit_id}_set_temp_offset).publish_state(val);
+      }
+      return val;
+
+  # Humidity calibration offset in percentage points.
+  # Bytes 2-3: big-endian signed 16-bit, divide by 100.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${unit_id}_BLE
+    name: "${unit_name} - Humidity Offset"
+    id: ${unit_id}_humidity_offset
+    service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+    characteristic_uuid: f8b2284e-61dd-44e3-a782-a93c9503ab2d
+    icon: "mdi:water-percent-alert"
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+    lambda: |-
+      int16_t offset_raw = (int16_t)((x[2] << 8) | x[3]);
+      float val = offset_raw / 100.0f;
+      // Sync the "Set Humidity Offset" entity with device readback
+      if (std::abs(id(${unit_id}_set_humidity_offset).state - val) > 0.05f) {
+        id(${unit_id}_set_humidity_offset).publish_state(val);
+      }
+      return val;
+
+  # ---------- Device Configuration Readback (C_CONFIGURATION) ----------
+  # These are read-only views of the device's configuration.
+
+  # Unit role in a multi-VMC setup (read-only from device configuration).
+  # 0 = not configured (standalone), 1 = master, 2 = slave.
+  # Master/slave is for coordinating two VMCs in the same room — master
+  # controls timing, slave follows. Configured via the Intelliclima app.
+  # Most residential installations use standalone mode (0).
+  #
+  # This sensor also syncs all C_CONFIGURATION readback values to their
+  # corresponding HA entities (thresholds, advanced mode, season, free cooling).
+  #
+  # HA entity: sensor.vmc_<unit>_role
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${unit_id}_BLE
+    name: "${unit_name} - Role"
+    id: ${unit_id}_role
+    service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+    characteristic_uuid: d3dac48e-b4e1-4f3a-8715-326ddf1da89a
+    icon: "mdi:account-cog"
+    lambda: |-
+      // Byte 0: role
+      float role = (float)x[0];
+
+      // --- Sync sensor threshold entities from device readback ---
+      // Using publish_state() instead of make_call() to update HA without
+      // triggering set_action (which would write the same values back via BLE).
+
+      // Byte 1: humidity threshold (0-3 base, +128 = advanced mode on)
+      uint8_t hum_raw = x[1];
+      bool hum_adv = hum_raw >= 128;
+      uint8_t hum_base = hum_adv ? (hum_raw - 128) : hum_raw;
+      if (hum_base <= 3) {
+        id(${unit_id}_humidity_threshold).publish_state(hum_base);
+      }
+      if (id(${unit_id}_humidity_advanced).state != hum_adv) {
+        id(${unit_id}_humidity_advanced).publish_state(hum_adv);
+      }
+
+      // Byte 2: luminosity threshold (0-3, no advanced flag)
+      uint8_t lum = x[2];
+      if (lum <= 3) {
+        id(${unit_id}_luminosity_threshold).publish_state(lum);
+      }
+
+      // Byte 3: VOC threshold (0-3 base, +128 = advanced mode on)
+      uint8_t voc_raw = x[3];
+      bool voc_adv = voc_raw >= 128;
+      uint8_t voc_base = voc_adv ? (voc_raw - 128) : voc_raw;
+      if (voc_base <= 3) {
+        id(${unit_id}_voc_threshold).publish_state(voc_base);
+      }
+      if (id(${unit_id}_voc_advanced).state != voc_adv) {
+        id(${unit_id}_voc_advanced).publish_state(voc_adv);
+      }
+
+      // --- Sync season & free cooling from byte 4 ---
+      uint8_t byte4 = x[4];
+      // Bit 3: season flag (0=winter, 1=summer)
+      bool is_summer = (byte4 >> 3) & 0x01;
+      std::string expected = is_summer ? "Summer" : "Winter";
+      if (id(${unit_id}_season_select).current_option() != expected) {
+        id(${unit_id}_season_select).publish_state(expected);
+      }
+      // Bits 0-1: free cooling value
+      uint8_t fc = byte4 & 0x03;
+      std::string fc_expected = "Off";
+      if (fc == 1) fc_expected = "Low";
+      else if (fc == 2) fc_expected = "Medium";
+      else if (fc == 3) fc_expected = "High";
+      if (id(${unit_id}_free_cooling_select).current_option() != fc_expected) {
+        id(${unit_id}_free_cooling_select).publish_state(fc_expected);
+      }
+
+      return role;
+
+
+# ==============================================================================
+# BUTTONS
+# ==============================================================================
+button:
+  # Manually trigger BLE pairing with the VMC device.
+  # Normally pairing happens automatically on connect, but this button
+  # can be used to re-pair if the bond is lost.
+  - platform: template
+    name: "${unit_name} - Pair"
+    id: ${unit_id}_pair
+    icon: "mdi:bluetooth-settings"
+    on_press:
+      then:
+        - ble_client.connect: ${unit_id}_BLE
+        - lambda: |-
+            ESP_LOGI("ble", "Pairing with ${unit_name}...");
+            id(${unit_id}_BLE)->pair();
+
+# --- Clock Sync (hourly) ---
+# Writes current date/time from HA to the VMC internal clock via BLE.
+# The device uses day_of_week 0=Monday..6=Sunday (HA uses 1=Sunday..7=Saturday).
+interval:
+  - interval: 1h
+    then:
+      - if:
+          condition:
+            lambda: 'return id(ha_time).now().is_valid();'
+          then:
+            - lambda: |-
+                auto now = id(ha_time).now();
+                uint8_t dow = now.day_of_week;
+                uint8_t device_dow = (dow == 1) ? 6 : dow - 2;
+                ESP_LOGI("clock", "${unit_name}: syncing clock %04d-%02d-%02d %02d:%02d:%02d (dow=%d)",
+                  now.year, now.month, now.day_of_month, now.hour, now.minute, now.second, device_dow);
+            - ble_client.ble_write:
+                id: ${unit_id}_BLE
+                service_uuid: f4b827c3-e660-4bc8-bdf6-3c8e9b845e0d
+                characteristic_uuid: 82788997-49e4-4533-b949-7ed433678044
+                value: !lambda |-
+                  auto now = id(ha_time).now();
+                  uint8_t dow = now.day_of_week;
+                  uint8_t device_dow = (dow == 1) ? 6 : dow - 2;
+                  return {(uint8_t)(now.year % 100), (uint8_t)now.month, (uint8_t)now.day_of_month,
+                          device_dow, (uint8_t)now.hour, (uint8_t)now.minute, (uint8_t)now.second, 0x00};
+          else:
+            - lambda: 'ESP_LOGW("clock", "${unit_name}: time not yet available, skipping sync");'
